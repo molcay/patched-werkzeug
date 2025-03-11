@@ -1,5 +1,6 @@
 import typing as t
 from datetime import datetime
+from urllib.parse import parse_qsl
 
 from .._internal import _to_str
 from ..datastructures import Accept
@@ -26,12 +27,11 @@ from ..http import parse_list_header
 from ..http import parse_options_header
 from ..http import parse_range_header
 from ..http import parse_set_header
-from ..urls import url_decode
 from ..user_agent import UserAgent
 from ..utils import cached_property
 from ..utils import header_property
 from .http import parse_cookie
-from .utils import get_current_url
+from .utils import get_current_url, get_content_length
 from .utils import get_host
 
 
@@ -177,11 +177,13 @@ class Request:
         :attr:`parameter_storage_class` to a different type.  This might
         be necessary if the order of the form data is important.
         """
-        return url_decode(
-            self.query_string,
-            self.url_charset,
-            errors=self.encoding_errors,
-            cls=self.parameter_storage_class,
+        return self.parameter_storage_class(
+            parse_qsl(
+                self.query_string.decode(self.url_charset),
+                keep_blank_values=True,
+                encoding=self.url_charset,
+                errors=self.encoding_errors,
+            )
         )
 
     @cached_property
@@ -273,17 +275,10 @@ class Request:
         the entity-body that would have been sent had the request been a
         GET.
         """
-        if self.headers.get("Transfer-Encoding", "") == "chunked":
-            return None
-
-        content_length = self.headers.get("Content-Length")
-        if content_length is not None:
-            try:
-                return max(0, int(content_length))
-            except (ValueError, TypeError):
-                pass
-
-        return None
+        return get_content_length(
+            http_content_length=self.headers.get("Content-Length"),
+            http_transfer_encoding=self.headers.get("Transfer-Encoding"),
+        )
 
     content_encoding = header_property[str](
         "Content-Encoding",

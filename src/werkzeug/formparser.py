@@ -1,13 +1,15 @@
-import typing as t
-from functools import update_wrapper
-from io import BytesIO
-from itertools import chain
-from typing import Union
+from __future__ import annotations
 
-from . import exceptions
+import typing as t
+import warnings
+from io import BytesIO
+from urllib.parse import parse_qsl
+
+from ._internal import _plain_int
 from .datastructures import FileStorage
 from .datastructures import Headers
 from .datastructures import MultiDict
+from .exceptions import RequestEntityTooLarge
 from .http import parse_options_header
 from .sansio.multipart import Data
 from .sansio.multipart import Epilogue
@@ -15,8 +17,6 @@ from .sansio.multipart import Field
 from .sansio.multipart import File
 from .sansio.multipart import MultipartDecoder
 from .sansio.multipart import NeedData
-from .urls import url_decode_stream
-from .wsgi import _make_chunk_iter
 from .wsgi import get_content_length
 from .wsgi import get_input_stream
 
@@ -33,7 +33,9 @@ if t.TYPE_CHECKING:
     import typing as te
     from _typeshed.wsgi import WSGIEnvironment
 
-    t_parse_result = t.Tuple[t.IO[bytes], MultiDict, MultiDict]
+    t_parse_result = t.Tuple[
+        t.IO[bytes], MultiDict[str, str], MultiDict[str, FileStorage]
+    ]
 
     class TStreamFactory(te.Protocol):
         def __call__(
@@ -45,14 +47,7 @@ if t.TYPE_CHECKING:
         ) -> t.IO[bytes]:
             ...
 
-
 F = t.TypeVar("F", bound=t.Callable[..., t.Any])
-
-
-def _exhaust(stream: t.IO[bytes]) -> None:
-    bts = stream.read(64 * 1024)
-    while bts:
-        bts = stream.read(64 * 1024)
 
 
 def default_stream_factory(
@@ -74,12 +69,14 @@ def default_stream_factory(
 def parse_form_data(
     environ: "WSGIEnvironment",
     stream_factory: t.Optional["TStreamFactory"] = None,
-    charset: str = "utf-8",
-    errors: str = "replace",
+    charset: t.Optional[str] = None,
+    errors: t.Optional[str] = None,
     max_form_memory_size: t.Optional[int] = None,
     max_content_length: t.Optional[int] = None,
-    cls: t.Optional[t.Type[MultiDict]] = None,
+    cls: t.Optional[t.Type[MultiDict[str, t.Any]]] = None,
     silent: bool = True,
+    *,
+    max_form_parts: t.Optional[int] = None,
 ) -> "t_parse_result":
     """Parse the form data in the environ and return it as tuple in the form
     ``(stream, form, files)``.  You should only call this method if the
@@ -93,13 +90,6 @@ def parse_form_data(
     This is a shortcut for the common usage of :class:`FormDataParser`.
 
     Have a look at :doc:`/request_data` for more details.
-
-    .. versionadded:: 0.5
-       The `max_form_memory_size`, `max_content_length` and
-       `cls` parameters were added.
-
-    .. versionadded:: 0.5.1
-       The optional `silent` flag was added.
 
     :param environ: the WSGI environment to be used for parsing.
     :param stream_factory: An optional callable that returns a new read and
@@ -119,38 +109,33 @@ def parse_form_data(
     :param cls: an optional dict class to use.  If this is not specified
                        or `None` the default :class:`MultiDict` is used.
     :param silent: If set to False parsing errors will not be caught.
+    :param max_form_parts: The maximum number of multipart to be parsed. If this is
+        exceeded, a :exc:`~exceptions.RequestEntityTooLarge` exception is raised.
     :return: A tuple in the form ``(stream, form, files)``.
+
+
+    .. versionchanged:: 2.3
+        Added the ``max_form_parts`` parameter.
+
+    .. versionchanged:: 2.3
+        The ``charset`` and ``errors`` parameters are deprecated and will be removed in
+        Werkzeug 3.0.
+
+    .. versionadded:: 0.5.1
+       Added the ``silent`` parameter.
+
+    .. versionadded:: 0.5
+       Added the ``max_form_memory_size``, ``max_content_length``, and ``cls``
+       parameters.
     """
     return FormDataParser(
-        stream_factory,
-        charset,
-        errors,
-        max_form_memory_size,
-        max_content_length,
-        cls,
-        silent,
+        stream_factory=stream_factory,
+        max_form_memory_size=max_form_memory_size,
+        max_content_length=max_content_length,
+        max_form_parts=max_form_parts,
+        silent=silent,
+        cls=cls,
     ).parse_from_environ(environ)
-
-
-def exhaust_stream(f: F) -> F:
-    """Helper decorator for methods that exhausts the stream on return."""
-
-    def wrapper(self, stream, *args, **kwargs):  # type: ignore
-        try:
-            return f(self, stream, *args, **kwargs)
-        finally:
-            exhaust = getattr(stream, "exhaust", None)
-
-            if exhaust is not None:
-                exhaust()
-            else:
-                while True:
-                    chunk = stream.read(1024 * 64)
-
-                    if not chunk:
-                        break
-
-    return update_wrapper(t.cast(F, wrapper), f)
 
 
 class FormDataParser:
@@ -159,8 +144,6 @@ class FormDataParser:
     and extended but for most mimetypes it is a better idea to use the
     untouched stream and expose it as separate attributes on a request
     object.
-
-    .. versionadded:: 0.8
 
     :param stream_factory: An optional callable that returns a new read and
                            writeable file descriptor.  This callable works
@@ -179,34 +162,65 @@ class FormDataParser:
     :param cls: an optional dict class to use.  If this is not specified
                        or `None` the default :class:`MultiDict` is used.
     :param silent: If set to False parsing errors will not be caught.
-    :param max_form_parts: The maximum number of parts to be parsed. If this is
+    :param max_form_parts: The maximum number of multipart to be parsed. If this is
         exceeded, a :exc:`~exceptions.RequestEntityTooLarge` exception is raised.
+
+    .. versionchanged:: 2.3
+        The ``charset`` and ``errors`` parameters are deprecated and will be removed in
+        Werkzeug 3.0.
+    .. versionchanged:: 2.3
+        The ``parse_functions`` attribute and ``get_parse_func`` methods are deprecated
+        and will be removed in Werkzeug 3.0.
+    .. versionchanged:: 2.2.3
+        Added the ``max_form_parts`` parameter.
+    .. versionadded:: 0.8
     """
 
     def __init__(
         self,
         stream_factory: t.Optional["TStreamFactory"] = None,
-        charset: str = "utf-8",
-        errors: str = "replace",
+        charset: str | None = None,
+        errors: str | None = None,
         max_form_memory_size: t.Optional[int] = None,
         max_content_length: t.Optional[int] = None,
-        cls: t.Optional[t.Type[MultiDict]] = None,
+        cls: t.Optional[t.Type[MultiDict[str, t.Any]]] = None,
         silent: bool = True,
         *,
         max_form_parts: t.Optional[int] = None,
     ) -> None:
         if stream_factory is None:
             stream_factory = default_stream_factory
-
         self.stream_factory = stream_factory
+
+        if charset is not None:
+            warnings.warn(
+                "The 'charset' parameter is deprecated and will be"
+                " removed in Werkzeug 3.0.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        else:
+            charset = "utf-8"
+
         self.charset = charset
+
+        if errors is not None:
+            warnings.warn(
+                "The 'errors' parameter is deprecated and will be"
+                " removed in Werkzeug 3.0.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        else:
+            errors = "replace"
+
         self.errors = errors
         self.max_form_memory_size = max_form_memory_size
         self.max_content_length = max_content_length
         self.max_form_parts = max_form_parts
 
         if cls is None:
-            cls = MultiDict
+            cls = t.cast("type[MultiDict[str, t.Any]]", MultiDict)
 
         self.cls = cls
         self.silent = silent
@@ -219,7 +233,35 @@ class FormDataParser:
             "t_parse_result",
         ]
     ]:
-        return self.parse_functions.get(mimetype)
+        warnings.warn(
+            "The 'get_parse_func' method is deprecated and will be"
+            " removed in Werkzeug 3.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+        if mimetype == "multipart/form-data":
+            return type(self)._parse_multipart
+        elif mimetype == "application/x-www-form-urlencoded":
+            return type(self)._parse_urlencoded
+        elif mimetype == "application/x-url-encoded":
+            warnings.warn(
+                "The 'application/x-url-encoded' mimetype is invalid, and will not be"
+                " treated as 'application/x-www-form-urlencoded' in Werkzeug 3.0.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return type(self)._parse_urlencoded
+        elif mimetype in self.parse_functions:
+            warnings.warn(
+                "The 'parse_functions' attribute is deprecated and will be removed in"
+                " Werkzeug 3.0. Override 'parse' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return self.parse_functions[mimetype]
+
+        return None
 
     def parse_from_environ(self, environ: "WSGIEnvironment") -> "t_parse_result":
         """Parses the information from the environment as form data.
@@ -227,10 +269,15 @@ class FormDataParser:
         :param environ: the WSGI environment to be used for parsing.
         :return: A tuple in the form ``(stream, form, files)``.
         """
-        content_type = environ.get("CONTENT_TYPE", "")
+        stream = get_input_stream(environ, max_content_length=self.max_content_length)
         content_length = get_content_length(environ)
-        mimetype, options = parse_options_header(content_type)
-        return self.parse(get_input_stream(environ), mimetype, content_length, options)
+        mimetype, options = parse_options_header(environ.get("CONTENT_TYPE"))
+        return self.parse(
+            stream,
+            content_length=content_length,
+            mimetype=mimetype,
+            options=options,
+        )
 
     def parse(
         self,
@@ -248,31 +295,45 @@ class FormDataParser:
         :param options: optional mimetype parameters (used for
                         the multipart boundary for instance)
         :return: A tuple in the form ``(stream, form, files)``.
+
+        .. versionchanged:: 2.3
+            The ``application/x-url-encoded`` content type is deprecated and will not be
+            treated as ``application/x-www-form-urlencoded`` in Werkzeug 3.0.
         """
-        if (
-            self.max_content_length is not None
-            and content_length is not None
-            and content_length > self.max_content_length
-        ):
-            # if the input stream is not exhausted, firefox reports Connection Reset
-            _exhaust(stream)
-            raise exceptions.RequestEntityTooLarge()
+        if mimetype == "multipart/form-data":
+            parse_func = self._parse_multipart
+        elif mimetype == "application/x-www-form-urlencoded":
+            parse_func = self._parse_urlencoded
+        elif mimetype == "application/x-url-encoded":
+            warnings.warn(
+                "The 'application/x-url-encoded' mimetype is invalid, and will not be"
+                " treated as 'application/x-www-form-urlencoded' in Werkzeug 3.0.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            parse_func = self._parse_urlencoded
+        elif mimetype in self.parse_functions:
+            warnings.warn(
+                "The 'parse_functions' attribute is deprecated and will be removed in"
+                " Werkzeug 3.0. Override 'parse' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            parse_func = self.parse_functions[mimetype].__get__(self, type(self))
+        else:
+            return stream, self.cls(), self.cls()
 
         if options is None:
             options = {}
 
-        parse_func = self.get_parse_func(mimetype, options)
-
-        if parse_func is not None:
-            try:
-                return parse_func(self, stream, mimetype, content_length, options)
-            except ValueError:
-                if not self.silent:
-                    raise
+        try:
+            return parse_func(stream, mimetype, content_length, options)
+        except ValueError:
+            if not self.silent:
+                raise
 
         return stream, self.cls(), self.cls()
 
-    @exhaust_stream
     def _parse_multipart(
         self,
         stream: t.IO[bytes],
@@ -281,12 +342,10 @@ class FormDataParser:
         options: t.Dict[str, str],
     ) -> "t_parse_result":
         parser = MultiPartParser(
-            self.stream_factory,
-            self.charset,
-            self.errors,
+            stream_factory=self.stream_factory,
             max_form_memory_size=self.max_form_memory_size,
-            cls=self.cls,
             max_form_parts=self.max_form_parts,
+            cls=self.cls,
         )
         boundary = options.get("boundary", "").encode("ascii")
 
@@ -296,7 +355,6 @@ class FormDataParser:
         form, files = parser.parse(stream, boundary, content_length)
         return stream, form, files
 
-    @exhaust_stream
     def _parse_urlencoded(
         self,
         stream: t.IO[bytes],
@@ -309,12 +367,19 @@ class FormDataParser:
             and content_length is not None
             and content_length > self.max_form_memory_size
         ):
-            # if the input stream is not exhausted, firefox reports Connection Reset
-            _exhaust(stream)
-            raise exceptions.RequestEntityTooLarge()
+            raise RequestEntityTooLarge
 
-        form = url_decode_stream(stream, self.charset, errors=self.errors, cls=self.cls)
-        return stream, form, self.cls()
+        try:
+            items = parse_qsl(
+                stream.read().decode(),
+                keep_blank_values=True,
+                encoding=self.charset,
+                errors="werkzeug.url_quote",
+            )
+        except ValueError as e:
+            raise RequestEntityTooLarge() from e
+
+        return stream, self.cls(items), self.cls()
 
     #: mapping of mimetypes to parsing functions
     parse_functions: t.Dict[
@@ -323,39 +388,18 @@ class FormDataParser:
             ["FormDataParser", t.IO[bytes], str, t.Optional[int], t.Dict[str, str]],
             "t_parse_result",
         ],
-    ] = {
-        "multipart/form-data": _parse_multipart,
-        "application/x-www-form-urlencoded": _parse_urlencoded,
-        "application/x-url-encoded": _parse_urlencoded,
-    }
-
-
-def _line_parse(line: str) -> t.Tuple[str, bool]:
-    """Removes line ending characters and returns a tuple (`stripped_line`,
-    `is_terminated`).
-    """
-    if line[-2:] == "\r\n":
-        return line[:-2], True
-
-    elif line[-1:] in {"\r", "\n"}:
-        return line[:-1], True
-
-    return line, False
+    ] = {}
 
 
 class MultiPartParser:
     def __init__(
         self,
         stream_factory: t.Optional["TStreamFactory"] = None,
-        charset: str = "utf-8",
-        errors: str = "replace",
         max_form_memory_size: t.Optional[int] = None,
-        cls: t.Optional[t.Type[MultiDict]] = None,
+        cls: t.Optional[t.Type[MultiDict[str, t.Any]]] = None,
         buffer_size: int = 64 * 1024,
         max_form_parts: t.Optional[int] = None,
     ) -> None:
-        self.charset = charset
-        self.errors = errors
         self.max_form_memory_size = max_form_memory_size
         self.max_form_parts = max_form_parts
 
@@ -365,10 +409,9 @@ class MultiPartParser:
         self.stream_factory = stream_factory
 
         if cls is None:
-            cls = MultiDict
+            cls = t.cast("type[MultiDict[str, t.Any]]", MultiDict)
 
         self.cls = cls
-
         self.buffer_size = buffer_size
 
     def fail(self, message: str) -> "te.NoReturn":
@@ -379,10 +422,15 @@ class MultiPartParser:
         content_type = headers.get("content-type")
 
         if content_type:
-            mimetype, ct_params = parse_options_header(content_type)
-            return ct_params.get("charset", self.charset)
+            parameters = parse_options_header(content_type)[1]
+            ct_charset = parameters.get("charset", "").lower()
 
-        return self.charset
+            # A safe list of encodings. Modern clients should only send ASCII or UTF-8.
+            # This list will not be extended further.
+            if ct_charset in {"ascii", "us-ascii", "utf-8", "iso-8859-1"}:
+                return ct_charset
+
+        return "utf-8"
 
     def start_file_streaming(
         self, event: File, total_content_length: t.Optional[int]
@@ -390,7 +438,7 @@ class MultiPartParser:
         content_type = event.headers.get("content-type")
 
         try:
-            content_length = int(event.headers["content-length"])
+            content_length = _plain_int(event.headers["content-length"])
         except (KeyError, ValueError):
             content_length = 0
 
@@ -404,45 +452,49 @@ class MultiPartParser:
 
     def parse(
         self, stream: t.IO[bytes], boundary: bytes, content_length: t.Optional[int]
-    ) -> t.Tuple[MultiDict, MultiDict]:
-        container: t.Union[t.IO[bytes], t.List[bytes]]
+    ) -> t.Tuple[MultiDict[str, str], MultiDict[str, FileStorage]]:
+        current_part: Field | File
+        field_size: int | None = None
+        container: t.IO[bytes] | list[bytes]
         _write: t.Callable[[bytes], t.Any]
 
-        iterator = chain(
-            _make_chunk_iter(
-                stream,
-                limit=content_length,
-                buffer_size=self.buffer_size,
-            ),
-            [None],
-        )
-
         parser = MultipartDecoder(
-            boundary, self.max_form_memory_size, max_parts=self.max_form_parts
+            boundary,
+            max_form_memory_size=self.max_form_memory_size,
+            max_parts=self.max_form_parts,
         )
 
         fields = []
         files = []
 
-        current_part: Union[Field, File]
-        for data in iterator:
+        for data in _chunk_iter(stream.read, self.buffer_size):
             parser.receive_data(data)
             event = parser.next_event()
             while not isinstance(event, (Epilogue, NeedData)):
                 if isinstance(event, Field):
                     current_part = event
+                    field_size = 0
                     container = []
                     _write = container.append
                 elif isinstance(event, File):
                     current_part = event
+                    field_size = None
                     container = self.start_file_streaming(event, content_length)
                     _write = container.write
                 elif isinstance(event, Data):
+                    if self.max_form_memory_size is not None and field_size is not None:
+                        # Ensure that accumulated data events do not exceed limit.
+                        # Also checked within single event in MultipartDecoder.
+                        field_size += len(event.data)
+
+                        if field_size > self.max_form_memory_size:
+                            raise RequestEntityTooLarge()
+
                     _write(event.data)
                     if not event.more_data:
                         if isinstance(current_part, Field):
                             value = b"".join(container).decode(
-                                self.get_part_charset(current_part.headers), self.errors
+                                self.get_part_charset(current_part.headers), "replace"
                             )
                             fields.append((current_part.name, value))
                         else:
@@ -463,3 +515,18 @@ class MultiPartParser:
                 event = parser.next_event()
 
         return self.cls(fields), self.cls(files)
+
+
+def _chunk_iter(read: t.Callable[[int], bytes], size: int) -> t.Iterator[bytes | None]:
+    """Read data in chunks for multipart/form-data parsing. Stop if no data is read.
+    Yield ``None`` at the end to signal end of parsing.
+    """
+    while True:
+        data = read(size)
+
+        if not data:
+            break
+
+        yield data
+
+    yield None

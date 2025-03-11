@@ -104,6 +104,9 @@ def test_url_bytes_decoding():
     assert x[b"uni"] == "Hänsel".encode()
 
 
+@pytest.mark.filterwarnings("ignore:'werkzeug.urls.url_decode_stream:DeprecationWarning")
+@pytest.mark.filterwarnings("ignore:'make_chunk_iter:DeprecationWarning")
+@pytest.mark.filterwarnings("ignore:'_make_chunk_iter:DeprecationWarning")
 def test_stream_decoding_string_fails():
     pytest.raises(TypeError, urls.url_decode_stream, "testing")
 
