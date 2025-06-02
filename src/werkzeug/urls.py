@@ -7,6 +7,7 @@ import codecs
 import os
 import re
 import typing as t
+import warnings
 
 from ._internal import _check_str_tuple
 from ._internal import _decode_idna
@@ -894,6 +895,13 @@ def url_decode_stream(
 
     .. versionadded:: 0.8
     """
+    warnings.warn(
+        "'werkzeug.urls.url_decode_stream' is deprecated and will be removed in"
+        " Werkzeug 2.4. Use 'urllib.parse.parse_qs' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     from .wsgi import make_chunk_iter
 
     pair_iter = make_chunk_iter(stream, separator, limit)
